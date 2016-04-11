@@ -1,0 +1,182 @@
+/*
+ *  main.cpp
+ *  Created by Jérémy Riousset on 11/19/07.
+ */
+
+#include "Input.h"
+#include "Utils.h"
+
+void Update_GP(CMatrix3D& MM, SizeGrid local_N, PointsColor CC);
+
+int main(int argc, char** argv)
+{
+	/*DEFINE SIMULATION VARIABLES**************************************************/
+	Var::N.x =  26; // WE MUST HAVE N.x and N.y even (else it unbalance the load on the processes)
+	Var::N.y =  26;
+	Var::N.z =  26;
+	Var::L.init(25,25,25);
+	Var::d.init(Var::L,Var::N);
+	/******************************************************************************/
+	
+	/*START MPI********************************************************************/
+	MPI_Init(&argc, &argv);
+	/******************************************************************************/
+	
+	/*CREATE COMMUNICATORS AND TOPOLOGIES*/
+	CreateComm();
+	CreateGridComm();
+	CreateCartComm();
+	
+	/*CREATE CHARGE DENSITY ON PROCESS ROOT*/
+	if (MPI_Var::world_rank == MPI_Var::root)
+	{
+		Var::Un.init( Var::N.x,Var::N.y,Var::N.z);
+		Var::phi.init(Var::N.x,Var::N.y,Var::N.z);
+		Var::rho.init(Var::N.x,Var::N.y,Var::N.z);
+		Var::Q   = 100;
+		Var::Xq  = Var::L.x/2;
+		Var::Yq  = Var::L.y/2;
+		Var::Zq  = Var::L.z/2;
+		Var::Rq1 = 5;
+		
+		Var::C.sphere(Var::Q, Var::Xq,Var::Yq,Var::Zq, Var::Rq1, Var::d,Var::N);
+	}
+	
+	InitLocalDimensions();
+	
+/*	
+	 char local_name[50];
+	 sprintf(local_name, "results/local_tmp%d.dat", MPI_Var::world_rank+1);
+	 CMatrix3D local_tmp(Var::local_N.x,Var::local_N.y,Var::local_N.z);
+	 
+	 for(int ii = 0 ; ii < Var::local_N.x ; ii++) for(int jj = 0 ; jj < Var::local_N.y ; jj++) for(int kk = 0 ; kk < Var::local_N.z ; kk++)	
+	 local_tmp[ii][jj][kk] = MPI_Var::world_rank+1;
+	 
+	 CMatrix3D tmp(Var::N.x,Var::N.y,Var::N.z);
+	 tmp = Gather(local_tmp, 3);
+	 tmp.fwrite("results/tmp.dat");
+	 CreateLocalPlanes();
+	 Update_GP(local_tmp,Var::local_N,black);
+	 Update_GP(local_tmp,Var::local_N,red);
+	 local_tmp.fwrite(local_name);
+*/	 
+	
+//	if (MPI_Var::world_rank == MPI_Var::root)
+//	{	
+//		for(int ii = 0 ; ii < Var::N.x ; ii++) for(int jj = 0 ; jj < Var::N.y ; jj++) for(int kk = 0 ; kk < Var::N.y ; kk++)	
+//		if(ii>=Var::local_N.x || jj>=Var::local_N.y || kk>=Var::local_N.z) 
+//		{
+//			Var::Un[ii][jj][kk] = 1;
+//			//Var::phi[ii][jj][kk]=ii*Var::N.y*Var::N.z + jj*Var::N.z + kk;
+//		}
+//	}
+	
+	CMatrix1D Theoretical;
+	Theoretical = Var::C.MultipoleAnalyticalSolution(Var::d, Var::N);
+	Theoretical.fwrite("results/phiNum.dat");
+	
+	//SCATTER MATRICES//
+	Var::local_C    = Scatter(Var::C,3);											// Scatter in <b>3</b> dimensions
+	Var::local_Un   = Scatter(Var::Un,3);											// Scatter in <b>3</b> dimensions
+	Var::local_phi  = Scatter(Var::phi,3);											// Scatter in <b>3</b> dimensions
+	
+	//SOLVE POISSON'S EQUATION//
+	CreateLocalPlanes();
+
+	SorSolution		SOR;
+	SOR.init(Var::local_phi, Var::epsilon, Var::MaxStep, Var::d, Var::local_N, Var::local_C, Var::local_Un);
+
+	SOR.Solve(Var::d, Var::local_N, Var::local_Un, Var::local_phi);
+	
+	//GATHER SCATTERED MATRICES//
+	Var::phi = Gather(Var::local_phi, 3);
+
+	//STORE SOLUTION//
+	if (MPI_Var::world_rank == MPI_Var::root)
+	{
+//		cout<< Var::phi;
+		CMatrix1D phi1D(Var::N.z);
+		for(int kk=0 ; kk<Var::N.z ; kk++)
+			phi1D[kk] = Var::phi[Var::N.x/2][Var::N.y/2][kk];
+		
+		phi1D.fwrite("results/phiNum.dat");
+		Var::phi.fwrite("results/phi.dat");
+	}
+	/*
+	if(MPI_Var::x_rank == 0 && MPI_Var::y_rank == 0 && MPI_Var::z_rank == 0)
+	{
+		MPI_Send(&Var::local_rho.pElems[0],1 , MPI_Var::local_z_plane_red, 1, 0, MPI_Var::z_comm);
+	}
+	if(MPI_Var::x_rank == 0 && MPI_Var::y_rank == 0 && MPI_Var::z_rank == 1)
+	{
+		MPI_Recv(&Var::local_rho.pElems[0],1 , MPI_Var::local_z_plane_red, 0, 0, MPI_Var::z_comm, &MPI_Var::status);
+		cout<<Var::local_rho;
+	}
+	*/
+	
+	/*STOP MPI*********************************************************************/
+	FreeComm();
+	MPI_Finalize();
+	/******************************************************************************/
+	
+	return 0;
+}
+
+
+void Update_GP(CMatrix3D& MM, SizeGrid local_N, PointsColor CC)
+{	
+	
+	if(CC == red)
+	{
+		//SEND/RECV FRONT ROW//
+		MPI_Send(&MM.pElems[(local_N.x-2)*local_N.y*local_N.z],		1,MPI_Var::local_x_plane_red, MPI_Var::next_x_rank,	MPI_Var::tag,	MPI_Var::x_comm );
+		MPI_Recv( &MM.pElems[0],									1,MPI_Var::local_x_plane_red, MPI_Var::prev_x_rank,	MPI_Var::tag,	MPI_Var::x_comm, &MPI_Var::status);
+		MPI_Barrier(MPI_Var::x_comm);
+		
+		//SEND/RECV BACK ROW//
+		MPI_Send(&MM.pElems[local_N.y*local_N.z],					1,MPI_Var::local_x_plane_red, MPI_Var::prev_x_rank,	MPI_Var::tag,	MPI_Var::x_comm );
+		MPI_Recv( &MM.pElems[(local_N.x-1)*local_N.y*local_N.z],	1,MPI_Var::local_x_plane_red, MPI_Var::next_x_rank,	MPI_Var::tag,	MPI_Var::x_comm, &MPI_Var::status);
+		
+		//SEND/RECV LEFT ROW//
+		MPI_Send(&MM.pElems[(local_N.y-2)	*local_N.z],			1,MPI_Var::local_y_plane_red, MPI_Var::next_y_rank,	MPI_Var::tag,	MPI_Var::y_comm );
+		MPI_Recv( &MM.pElems[0],									1,MPI_Var::local_y_plane_red, MPI_Var::prev_y_rank,	MPI_Var::tag,	MPI_Var::y_comm, &MPI_Var::status);
+		
+		//SEND/RECV RIGHT ROW//
+		MPI_Send(&MM.pElems[local_N.z],								1,MPI_Var::local_y_plane_red, MPI_Var::prev_y_rank,	MPI_Var::tag,	MPI_Var::y_comm );
+		MPI_Recv( &MM.pElems[(local_N.y-1)*local_N.z],				1,MPI_Var::local_y_plane_red, MPI_Var::next_y_rank,	MPI_Var::tag,	MPI_Var::y_comm, &MPI_Var::status);
+		
+		//SEND/RECV TOP ROW//
+		MPI_Send(&MM.pElems[local_N.z-2],							1,MPI_Var::local_z_plane_red, MPI_Var::next_z_rank,	MPI_Var::tag,	MPI_Var::z_comm );
+		MPI_Recv( &MM.pElems[0],									1,MPI_Var::local_z_plane_red, MPI_Var::prev_z_rank,	MPI_Var::tag,	MPI_Var::z_comm, &MPI_Var::status);
+		
+		//SEND/RECV BOTTOM ROW//
+		MPI_Send(&MM.pElems[1],										1,MPI_Var::local_z_plane_red, MPI_Var::prev_z_rank,	MPI_Var::tag,	MPI_Var::z_comm );
+		MPI_Recv( &MM.pElems[local_N.z-1],							1,MPI_Var::local_z_plane_red, MPI_Var::next_z_rank,	MPI_Var::tag,	MPI_Var::z_comm, &MPI_Var::status);
+	}
+	if(CC == black)
+	{
+		//SEND/RECV FRONT ROW//
+		MPI_Send(&MM.pElems[(local_N.x-2)*local_N.y*local_N.z],		1,MPI_Var::local_x_plane_blk, MPI_Var::next_x_rank,	MPI_Var::tag,	MPI_Var::x_comm );
+		MPI_Recv( &MM.pElems[0],									1,MPI_Var::local_x_plane_blk, MPI_Var::prev_x_rank,	MPI_Var::tag,	MPI_Var::x_comm, &MPI_Var::status);
+		
+		//SEND/RECV BACK ROW//
+		MPI_Send(&MM.pElems[local_N.y*local_N.z],					1,MPI_Var::local_x_plane_blk, MPI_Var::prev_x_rank,	MPI_Var::tag,	MPI_Var::x_comm );
+		MPI_Recv( &MM.pElems[(local_N.x-1)*local_N.y*local_N.z],	1,MPI_Var::local_x_plane_blk, MPI_Var::next_x_rank,	MPI_Var::tag,	MPI_Var::x_comm, &MPI_Var::status);
+		
+		//SEND/RECV LEFT ROW//
+		MPI_Send(&MM.pElems[(local_N.y-2)*local_N.z],				1,MPI_Var::local_y_plane_blk, MPI_Var::next_y_rank,	MPI_Var::tag,	MPI_Var::y_comm );
+		MPI_Recv( &MM.pElems[0],									1,MPI_Var::local_y_plane_blk, MPI_Var::prev_y_rank,	MPI_Var::tag,	MPI_Var::y_comm, &MPI_Var::status);
+		
+		//SEND/RECV RIGHT ROW//
+		MPI_Send(&MM.pElems[local_N.z],								1,MPI_Var::local_y_plane_blk, MPI_Var::prev_y_rank,	MPI_Var::tag,	MPI_Var::y_comm );
+		MPI_Recv( &MM.pElems[(local_N.y-1)*local_N.z],				1,MPI_Var::local_y_plane_blk, MPI_Var::next_y_rank,	MPI_Var::tag,	MPI_Var::y_comm, &MPI_Var::status);
+		
+		//SEND/RECV TOP ROW//
+		MPI_Send(&MM.pElems[local_N.z-2],							1,MPI_Var::local_z_plane_blk, MPI_Var::next_z_rank,	MPI_Var::tag,	MPI_Var::z_comm );
+		MPI_Recv( &MM.pElems[0],									1,MPI_Var::local_z_plane_blk, MPI_Var::prev_z_rank,	MPI_Var::tag,	MPI_Var::z_comm, &MPI_Var::status);
+		
+		//SEND/RECV BOTTOM ROW//
+		MPI_Send(&MM.pElems[1],										1,MPI_Var::local_z_plane_blk, MPI_Var::prev_z_rank,	MPI_Var::tag,	MPI_Var::z_comm );
+		MPI_Recv( &MM.pElems[local_N.z-1],							1,MPI_Var::local_z_plane_blk, MPI_Var::next_z_rank,	MPI_Var::tag,	MPI_Var::z_comm, &MPI_Var::status);
+	}
+}
